@@ -1,0 +1,181 @@
+# @zakkster/lite-watch-ex
+
+> Extended watcher utilities for `@zakkster/lite-signal`. One-shot watchers
+> with auto-dispose, predicate-gated watchers, Vue-style `watchEffect`. Zero
+> JS-heap allocations per source change in steady state. Re-exports the core
+> `watch` / `when` / `whenAsync`. ESM-only, MIT licensed, ~1 KB min+gz.
+
+Three new exports plus three re-exports. All three new ones build on
+lite-signal's `effect` + `untrack` + `onCleanup`. One-shots truly self-dispose
+on fire -- the effect node returns to lite-signal's pool, not merely silenced
+by a flag.
+
+## Core API
+
+- **`watchOnce(source, callback, options?)`** -- fire once on the first
+  non-equal change (or immediately, if `options.immediate === true`), then
+  self-dispose.
+- **`watchUntil(source, predicate, callback)`** -- fire once when
+  `predicate(newValue)` first passes on a changed value (or initially if
+  already truthy), then self-dispose.
+- **`watchEffect(callback)`** -- `effect()` with `onCleanup` pre-injected as
+  a callback argument. Vue-style ergonomic; identical alloc profile to
+  plain `effect()`.
+
+- **`watchPrevious(source, callback, options?)`** (1.1) -- rolling history;
+  callback gets `(current, history, stop)` with the previous `depth` values
+  (default 1), newest-first, in a reused buffer. `copy` for a fresh array.
+- **`watchChanged(source, predicate, callback, options?)`** (1.1) -- ongoing
+  watcher gated by a `(new, old)` predicate; fires on every passing change.
+- **`pausableWatch(source, callback, options?)`** (1.1) -- pausable ongoing
+  watcher; returns `{ stop, pause, resume, isPaused }`. `fireOnResume` for a
+  single catch-up on resume.
+- **`watchMany(sources, callback, options?)`** (1.1) -- fixed tuple of sources;
+  fires with `(values, oldValues, changedIndex, stop)`. Reused buffers; `copy`
+  for fresh arrays.
+
+## Re-exports
+
+- **`watch`** -- ongoing watcher with `(next, prev, stop)` from lite-signal.
+- **`when`** -- fire once when predicate first truthy, no old/new pair.
+- **`whenAsync`** -- Promise variant of `when`. (!) allocates per call.
+
+Importing from `@zakkster/lite-watch-ex` or `@zakkster/lite-signal` resolves
+to the same function -- the re-export is for ergonomic convenience.
+
+## Architecture invariants
+
+- **Hoisted untrack body**: the `untrack(untrackedFire)` call passes a closure
+  allocated ONCE at registration. Shared state (currentNewValue, oldValue,
+  fired) lives in closure-scoped `let` bindings. Declaring `untrack(() => {...})`
+  inline inside the effect body would allocate a fresh closure per fire -- the
+  pattern lite-signal's `Watch.js` "ZERO-GC HOT PATH" comment warns against.
+  This package follows that warning.
+- **Self-dispose from inside the effect**: when a one-shot fires, the
+  registered stop function is called from within the effect body. Signal.js's
+  effect dispose is idempotent and safe to call from within the executing
+  effect (verified at Signal.js:746-784) -- the node is destroyed and returns
+  to the pool. Subsequent source changes don't reach the watcher.
+- **Late-binding stop wrapper**: `stop` is a closure that resolves `stopFn`
+  lazily, with a `wantsStopEarly` flag for the case where the user calls
+  `stop()` synchronously inside an immediate-mode callback before `effect()`
+  has returned. Mirror of the pattern in lite-signal's `when()`.
+- **Intent guard via `Object.is`**: `NaN`-to-`NaN` is a no-op. `+0`/`-0`
+  distinct. Same equality contract as the rest of lite-signal.
+- **Callback reads are untracked**: callback body runs inside `untrack`, so
+  side-effect reads don't accidentally subscribe the watcher to other signals.
+
+## Performance characteristics
+
+- `watchOnce`/`watchUntil` per source change in steady state: O(1), zero
+  JS-heap alloc. Hot path is read source -> intent compare -> conditional
+  predicate eval -> optional callback + dispose.
+- `watchEffect` per source change: same as plain `effect()` from lite-signal.
+- Registration: one effect node + links from lite-signal's pools, plus 3
+  closures (effect body, untrackedFire body, stop wrapper) for one-shots, or
+  1 closure for `watchEffect`. All reused for the life of the instance.
+- Self-dispose: O(1) -- single flag flip + lite-signal's node release.
+
+## When to use
+
+- Initialization tied to a state transition: `watchOnce` (immediate or trailing).
+- Threshold alerts that should fire once and stop: `watchUntil`.
+- Reactive bodies with per-run teardown: `watchEffect` with `onCleanup`.
+- Vue / Solid migrations: `watchEffect` reads identically to the Vue version.
+
+## When NOT to use
+
+- Continuous observation: use `watch` (from lite-signal). One-shots are exactly
+  one-shot.
+- Truthiness gates without needing old/new pair: use `when` -- smaller surface.
+- Async control flow inside a render loop: `whenAsync` allocates a Promise per
+  call. Use `when` with a callback instead.
+
+## API summary
+
+```ts
+function watchOnce<T>(
+    source: () => T,
+    callback: (newValue: T, oldValue: T | undefined) => void,
+    options?: { immediate?: boolean }
+): () => void;
+
+function watchUntil<T>(
+    source: () => T,
+    predicate: (value: T) => unknown,
+    callback: (newValue: T, oldValue: T | undefined) => void
+): () => void;
+
+function watchEffect(
+    callback: (onCleanup: (fn: () => void) => void) => void
+): () => void;
+
+function watchPrevious<T>(
+    source: () => T,
+    callback: (current: T, history: Array<T | undefined>, stop: () => void) => void,
+    options?: { depth?: number; immediate?: boolean; copy?: boolean }
+): () => void;
+
+function watchChanged<T>(
+    source: () => T,
+    predicate: (newValue: T, oldValue: T | undefined) => unknown,
+    callback: (newValue: T, oldValue: T | undefined, stop: () => void) => void,
+    options?: { immediate?: boolean }
+): () => void;
+
+function pausableWatch<T>(
+    source: () => T,
+    callback: (newValue: T, oldValue: T | undefined, stop: () => void) => void,
+    options?: { immediate?: boolean; fireOnResume?: boolean }
+): { stop: () => void; pause: () => void; resume: () => void; readonly isPaused: boolean };
+
+function watchMany<T>(
+    sources: Array<() => T>,
+    callback: (values: T[], oldValues: T[], changedIndex: number, stop: () => void) => void,
+    options?: { immediate?: boolean; copy?: boolean }
+): () => void;
+
+// Re-exports -- see @zakkster/lite-signal
+function watch<T>(...): () => void;
+function when(...): () => void;
+function whenAsync(...): Promise<void>;
+```
+
+## Idioms
+
+```js
+// One-shot trailing
+const status = signal("loading");
+watchOnce(status, (next) => initialize(next));
+
+// One-shot immediate
+watchOnce(currentUser, (u) => greet(u), { immediate: true });
+
+// Predicate-gated one-shot
+watchUntil(() => player.health(), (h) => h <= 25, (h) => hud.warn(h));
+
+// Vue-style watchEffect with cleanup
+watchEffect((onCleanup) => {
+    const id = requestAnimationFrame(() => render());
+    onCleanup(() => cancelAnimationFrame(id));
+});
+```
+
+## File layout
+
+- `WatchEx.js`              -- implementations + JSDoc + re-exports.
+- `index.js`                -- barrel re-export of all six functions.
+- `index.d.ts`              -- TypeScript declarations.
+- `test/watchEx.test.mjs`   -- node:test behavior + heap-delta suite (not published).
+
+## Install
+
+```bash
+npm install @zakkster/lite-watch-ex @zakkster/lite-signal
+```
+
+`@zakkster/lite-signal` is a peer dependency.
+
+## License
+
+MIT (c) Zahary Shinikchiev

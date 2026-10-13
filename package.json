@@ -1,0 +1,78 @@
+{
+  "name": "@zakkster/lite-watch-ex",
+  "version": "1.1.0",
+  "description": "Extended watcher utilities for @zakkster/lite-signal: one-shot, predicate-gated, rolling-history, pausable, and multi-source watchers, plus Vue-style watchEffect. Zero-GC hot path. Re-exports the core watch/when/whenAsync.",
+  "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
+  "license": "MIT",
+  "type": "module",
+  "main": "./index.js",
+  "module": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "node": "./index.js",
+      "types": "./index.d.ts",
+      "import": "./index.js",
+      "default": "./index.js"
+    }
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "WatchEx.js",
+    "README.md",
+    "llms.txt",
+    "LICENSE.txt",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "test:gc": "node --expose-gc --test",
+    "verify": "npm run test:gc",
+    "bench": "node --expose-gc bench/benchmark.mjs"
+  },
+  "keywords": [
+    "watch",
+    "watcher",
+    "reaction",
+    "watch-once",
+    "watch-until",
+    "watch-effect",
+    "signal",
+    "signals",
+    "reactive",
+    "zero-gc",
+    "zero-allocation",
+    "lite-signal",
+    "performance",
+    "twitch-extension",
+    "watch-previous",
+    "watch-many",
+    "pausable-watch",
+    "rolling-history",
+    "predicate-gated"
+  ],
+  "peerDependencies": {
+    "@zakkster/lite-signal": "^1.1.5"
+  },
+  "devDependencies": {
+    "@zakkster/lite-signal": "^1.1.5"
+  },
+  "homepage": "https://github.com/PeshoVurtoleta/lite-watch-ex#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PeshoVurtoleta/lite-watch-ex.git"
+  },
+  "bugs": {
+    "url": "https://github.com/PeshoVurtoleta/lite-watch-ex/issues",
+    "email": "shinikchiev@yahoo.com"
+  },
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/PeshoVurtoleta"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "sideEffects": false
+}

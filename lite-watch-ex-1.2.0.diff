@@ -1,0 +1,1092 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9307956..f8007b1 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,49 @@ All notable changes to this project are documented in this file.
+ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+ 
++## [1.2.0] - 2026-10-13
++
++### Fixed
++
++- `pausableWatch`: `pause()` before the first change no longer records
++  `undefined` as the value-at-pause. The true baseline is recovered from the
++  inner watcher's `oldValue` on the first paused change (no extra source
++  read). Fixes a wrong `oldValue` on the `fireOnResume` catch-up, a spurious
++  catch-up after an A-B-A excursion, and a dropped catch-up when the value
++  changed to `undefined`.
++- `pausableWatch`: `resume()` after `stop()` (from the handle, or from the
++  callback's `stop` argument) no longer fires the callback; `pause()` /
++  `resume()` are inert and `isPaused` is `false` once stopped. The callback's
++  `stop` argument is now the handle's `stop`.
++- `watchOnce` / `watchUntil`: the effect node is disposed BEFORE the callback
++  runs. A throwing callback no longer leaks the node from the pool, and
++  effects created inside the callback are no longer adopted and immediately
++  cascade-disposed by the dying watcher (immediate fires are delivered after
++  registration completes, untracked, for the same reason).
++- `watchPrevious`: history and baseline are committed before the callback,
++  so a throwing callback no longer drops a value from the history.
++- `watchMany`: the non-copy `oldValues` commit runs in `finally`, so a
++  throwing callback no longer leaves a stale baseline (wrong `oldValues` and
++  `changedIndex` on the next fire). Buffer identity is unchanged.
++- `stop()` on every watcher drops its references to observed values and
++  buffers, so a retained `stop` handle no longer keeps them reachable.
++
++### Changed
++
++- `watchUntil` predicate now receives `(newValue, oldValue)` (`oldValue` is
++  `undefined` on the initial check), matching `watchChanged`.
++- `watchUntil` accepts `options` with `immediate` (default `true`, the
++  existing behavior); `immediate: false` skips the registration-time check.
++- `watchPrevious` / `watchMany` buffers are built with `push()` so V8 keeps
++  them PACKED instead of HOLEY (`new Array(n)` can never transition back).
++- File header now lists all seven watchers.
++
++### Added
++
++- `test/audit.test.mjs`: one regression test per audit finding.
++- `bench/elements-kind.mjs` (`--allow-natives-syntax`) and
++  `bench/retention.mjs` (`--expose-gc`) probes.
++
+ ## [1.1.0] - 2026-06-05
+ 
+ ### Added
+diff --git a/README.md b/README.md
+index 7eed90a..564c932 100644
+--- a/README.md
++++ b/README.md
+@@ -75,7 +75,7 @@ All three are thin layers on top of `effect` + `untrack` + `onCleanup`. They fol
+ ## What you get
+ 
+ - **`watchOnce(source, callback, options?)`** -- fire once on the first non-equal change (or immediately, if `options.immediate === true`), then self-dispose.
+-- **`watchUntil(source, predicate, callback)`** -- fire once when the predicate first passes on a changed value, then self-dispose.
++- **`watchUntil(source, predicate, callback, options?)`** -- fire once when the `(new, old)` predicate first passes on a changed value, then self-dispose.
+ - **`watchEffect(callback)`** -- `effect()` with `onCleanup` pre-injected as a callback argument. Identical alloc profile to plain `effect()`.
+ 
+ - **`watchPrevious(source, callback, options?)`** -- rolling history of the last `depth` values (default 1), most-recent-first, in a reused buffer. Velocity, smoothing, deltas.
+@@ -109,17 +109,20 @@ Watch a reactive source, fire `callback` exactly once on the first non-equal cha
+ 
+ Equality is `Object.is`. `NaN`-to-`NaN` is a no-op. Internal callback reads are untracked: side-effects don't accidentally re-track the source.
+ 
+-### `watchUntil(source, predicate, callback)`
++### `watchUntil(source, predicate, callback, options?)`
+ 
+ ```ts
+ function watchUntil<T>(
+     source: () => T,
+-    predicate: (value: T) => unknown,
+-    callback: (newValue: T, oldValue: T | undefined) => void
++    predicate: (newValue: T, oldValue: T | undefined) => unknown,
++    callback: (newValue: T, oldValue: T | undefined) => void,
++    options?: { immediate?: boolean }
+ ): () => void;
+ ```
+ 
+-Watch a reactive source until `predicate(newValue)` first returns truthy. On the initial run, fires immediately if the predicate is already truthy (with `oldValue = undefined`). On subsequent runs, fires only when both the value changes AND the predicate passes. Self-disposes on fire.
++Watch a reactive source until `predicate(newValue, oldValue)` first returns truthy. On the initial run, fires immediately if the predicate is already truthy (with `oldValue = undefined`); pass `{ immediate: false }` to skip that check and wait for the first change. On subsequent runs, fires only when both the value changes AND the predicate passes. Self-disposes on fire.
++
++The predicate sees the old value too, so delta conditions work: `(next, prev) => prev !== undefined && next - prev > 10`.
+ 
+ Distinct from `when`: `watchUntil` passes the projected value plus its previous value to the callback. `when` is "wait for truthy, fire callback with no arguments" -- use it when you don't need the value.
+ 
+@@ -220,12 +223,15 @@ The one-shot watchers are not just convenience over `watch` + a manual `stop()`
+ 
+ ## Semantics worth knowing
+ 
+-- **Self-dispose is real.** When a one-shot fires, `stop()` is called from inside the effect body. lite-signal's dispose is idempotent and safe to call from within the executing effect (`Signal.js:746-784`); the node is destroyed and returns to the pool. Subsequent source changes don't reach the watcher -- there's nothing left to reach.
++- **Self-dispose is real, and happens before the callback.** When a one-shot fires, the node is disposed and returned to the pool first, then the callback runs. A throwing callback cannot leak the node, and effects created inside the callback are not adopted (and immediately cascade-disposed) by the dying watcher. Subsequent source changes don't reach the watcher -- there's nothing left to reach.
+ - **`stop()` is idempotent and late-binding.** Safe to call before the watcher fires (cancels pre-emptively), safe to call from inside an immediate-mode callback on the very first run (deferred until `effect()` returns), safe to call multiple times.
+ - **`Object.is` for equality.** `NaN`-to-`NaN` is a no-op; `+0`/`-0` distinct. Matches the rest of the lite-signal contract.
+ - **Callback internal reads are untracked.** A `watchOnce` callback that reads other signals to perform side-effects won't accidentally subscribe -- the watcher only re-fires on the original `source`'s deps. Identical to core `watch`.
+ - **`watchEffect`'s `onCleanup` is the same as the standalone one.** It's the context-aware function imported from lite-signal, pre-passed for ergonomic convenience. Both work; pick the one that reads better at the call site.
+-- **`watchUntil` initial check is synchronous.** If the predicate is already truthy when you register, the callback fires synchronously inside the registration call with `oldValue = undefined`. Important if you rely on dispose timing for setup ordering.
++- **`watchUntil` initial check is synchronous.** If the predicate is already truthy when you register, the callback fires synchronously inside the registration call with `oldValue = undefined` (after the node is released). Important if you rely on dispose timing for setup ordering. `{ immediate: false }` turns the initial check off.
++- **Baselines commit before the callback.** The ongoing watchers (`watchPrevious`, `watchMany`, and core `watch` underneath the others) advance their old-value state even if the callback throws, so the next change reports a coherent `oldValue` / history / `changedIndex`.
++- **Writes to the source from inside the callback are not re-delivered to the same watcher.** lite-signal never re-runs an effect inside its own body: a synchronous write to the watched source from the callback is skipped by the engine's self-cycle guard, and a cascade through another effect runs after the current fire completes, never nested inside it.
++- **`stop()` releases observed values.** Holding on to a `stop` handle (for example in a cleanup array) does not keep the last observed values, history, or tuple buffers reachable.
+ 
+ ---
+ 
+@@ -339,7 +345,10 @@ function pausableWatch<T>(
+ An ongoing watcher you can pause and resume. Pausing suppresses the callback but
+ keeps the watcher alive -- pause/resume cycles cost zero reallocation, and the
+ value baseline is preserved. With `fireOnResume: true`, a single catch-up fire
+-delivers `(current, valueAtPause)` on resume if the value changed while paused.
++delivers `(current, valueAtPause)` on resume if the value changed while paused
++(an A-B-A excursion back to the pause value does not fire). After `stop()` --
++from the handle or from the callback's `stop` argument -- `pause()` and
++`resume()` are inert and `isPaused` is `false`.
+ 
+ ```js
+ const w = pausableWatch(cursor, (p) => render(p));
+diff --git a/WatchEx.js b/WatchEx.js
+index d742a5a..bb9c2d5 100644
+--- a/WatchEx.js
++++ b/WatchEx.js
+@@ -1,24 +1,29 @@
+ /**
+  * WatchEx.js -- extended watcher utilities for @zakkster/lite-signal.
+  *
+- * Adds three one-shot / convenience watchers on top of the core `watch`,
+- * `when`, and `whenAsync` from lite-signal:
+- *
+- *   watchOnce   -- fire once on the first change (or immediately, if requested),
+- *                 then self-dispose.
+- *   watchUntil  -- fire once when a predicate first passes on a changed value,
+- *                 then self-dispose.
+- *   watchEffect -- `effect()` with `onCleanup` pre-injected as a callback arg,
+- *                 matching the Vue ergonomic. Identical alloc profile to plain
+- *                 `effect()`.
++ * Adds seven watchers on top of the core `watch`, `when`, and `whenAsync`
++ * from lite-signal:
++ *
++ *   watchOnce     -- fire once on the first change (or immediately, if
++ *                   requested), then self-dispose.
++ *   watchUntil    -- fire once when a predicate first passes on a changed
++ *                   value, then self-dispose.
++ *   watchEffect   -- `effect()` with `onCleanup` pre-injected as a callback
++ *                   arg, matching the Vue ergonomic. Identical alloc profile to
++ *                   plain `effect()`.
++ *   watchPrevious -- ongoing watcher with a rolling, reused history buffer.
++ *   watchChanged  -- ongoing watcher gated by a (newValue, oldValue) predicate.
++ *   pausableWatch -- ongoing watcher with pause / resume / fireOnResume.
++ *   watchMany     -- ongoing watcher over a fixed tuple of sources.
+  *
+  * The core `watch`, `when`, and `whenAsync` are re-exported for convenience --
+  * they live canonically in @zakkster/lite-signal. Importing from either path
+  * resolves to the same function (same node in the reactive graph).
+  *
+  * Allocation profile:
+- *   At registration: 1 effect node, links, plus 3 closures (the effect body,
+- *   the hoisted untracked-fire body, and the late-binding `stop` wrapper).
++ *   At registration: 1 effect node, links, plus a fixed handful of closures
++ *   (the effect body, the hoisted untracked-fire body, and the late-binding
++ *   `stop` wrapper; reused buffers for watchPrevious / watchMany).
+  *   Per source change in steady state: zero JS-heap allocations from this
+  *   file. The untrack body is hoisted into a closure allocated once at
+  *   registration -- declaring it inline inside the effect would allocate a
+@@ -26,11 +31,22 @@
+  *   exists to warn against).
+  *
+  * Disposal semantics:
+- *   All three watchers return a `stop()` function. `watchOnce` and
+- *   `watchUntil` ALSO self-dispose synchronously when their condition fires --
+- *   the effect node is released back to lite-signal's pool, not just silenced
+- *   by a flag. `stop()` is idempotent: safe to call before the watcher fires,
+- *   safe to call after self-dispose, safe to call multiple times.
++ *   Every watcher returns a `stop()` function (pausableWatch: `handle.stop`).
++ *   `watchOnce` and `watchUntil` ALSO self-dispose synchronously when their
++ *   condition fires -- the effect node is released back to lite-signal's
++ *   pool BEFORE the callback runs, so a throwing callback cannot leak it and
++ *   effects created inside the callback are not adopted (and cascade-disposed)
++ *   by the dying watcher. `stop()` is idempotent and drops the watcher's
++ *   references to observed values, so a retained `stop` handle does not pin
++ *   them in memory.
++ *
++ * Ordering:
++ *   The ongoing watchers commit their baseline (old value, history, old tuple)
++ *   BEFORE invoking the callback. A callback that throws therefore leaves the
++ *   watcher coherent for the next change. (lite-signal never re-runs an effect
++ *   inside its own body: a synchronous write to the source from the callback
++ *   is skipped by the engine's self-cycle guard, and a cascade through another
++ *   effect runs in the next flush pass.)
+  */
+ 
+ import { effect, untrack, onCleanup, watch } from "@zakkster/lite-signal";
+@@ -79,40 +95,45 @@ export function watchOnce(source, callback, options) {
+     let oldValue = UNINITIALIZED;
+     let currentNewValue;
+     let stopFn = null;
+-    let wantsStopEarly = false;
+     let fired = false;
+ 
+-    // Late-binding stop: callable before `stopFn` is assigned (e.g.,
+-    // synchronously inside the immediate fire on first run), idempotent
+-    // afterwards. Mirror of the pattern in Watch.js's `when()`.
++    // Idempotent dispose. Drops the value slots so a retained `stop` handle
++    // does not pin the last observed values (the closure context outlives the
++    // effect node). `callback` never receives `stop`, and the immediate fire is
++    // delivered after `effect()` returns, so `stopFn` is always assigned by the
++    // time this can run -- no late-binding flag is needed here.
+     const stop = () => {
+-        if (stopFn !== null) stopFn();
+-        else wantsStopEarly = true;
++        fired = true;
++        oldValue = undefined;
++        currentNewValue = undefined;
++        if (stopFn !== null) {
++            const fn = stopFn;
++            stopFn = null;
++            fn();
++        }
+     };
+ 
+     // Hoisted untrack body -- allocated once, reused for every fire.
+     // Reads shared state via closure variables (currentNewValue, oldValue).
+     const untrackedFire = () => {
+         if (fired) return;
++        const next = currentNewValue;
++        const prev = oldValue;
+ 
+-        if (oldValue === UNINITIALIZED) {
+-            if (immediate) {
+-                fired = true;
+-                callback(currentNewValue, undefined);
+-                stop();
+-                return;
+-            }
+-            oldValue = currentNewValue;
++        if (prev === UNINITIALIZED) {
++            // Immediate fire is deferred until effect() returns (see below).
++            if (immediate) fired = true;
++            else oldValue = next;
+             return;
+         }
+ 
+-        if (!Object.is(currentNewValue, oldValue)) {
+-            fired = true;
+-            callback(currentNewValue, oldValue);
++        if (!Object.is(next, prev)) {
++            // Dispose BEFORE the callback: a throwing callback cannot leak the
++            // node, and effects created in the callback are not adopted by
++            // (and cascade-disposed with) this dying watcher.
+             stop();
+-            return;
++            callback(next, prev);
+         }
+-        oldValue = currentNewValue;
+     };
+ 
+     stopFn = effect(() => {
+@@ -121,17 +142,24 @@ export function watchOnce(source, callback, options) {
+         untrack(untrackedFire);
+     });
+ 
+-    // If `stop()` was called from inside the immediate fire on registration,
+-    // `stopFn` was still null at that point -- honor the deferred request now.
+-    if (wantsStopEarly) stopFn();
++    if (fired) {
++        // Immediate: dispose first, then deliver outside the effect body for
++        // the same two reasons as above. Untracked so an enclosing observer
++        // does not subscribe to the callback's reads. The closure is
++        // registration-time only (immediate path), never per change.
++        const next = currentNewValue;
++        stop();
++        untrack(() => callback(next, undefined));
++    }
+ 
+     return stop;
+ }
+ 
+ /**
+- * Watch a reactive source until `predicate(newValue)` first returns truthy
+- * AND the value has changed (or, on the initial run, if the predicate is
+- * already truthy). Fires `callback` exactly once, then self-disposes.
++ * Watch a reactive source until `predicate(newValue, oldValue)` first returns
++ * truthy AND the value has changed (or, on the initial run, if the predicate is
++ * already truthy -- skip that check with `immediate: false`). Fires `callback`
++ * exactly once, then self-disposes.
+  *
+  * Distinct from {@link when}: `watchUntil` projects the value through
+  * `source()` and passes it to `callback`, with old/new pair. `when` is for
+@@ -139,10 +167,18 @@ export function watchOnce(source, callback, options) {
+  *
+  * @template T
+  * @param {() => T} source                  Reactive read function.
+- * @param {(value: T) => unknown} predicate Returns truthy to fire.
++ * @param {(newValue: T, oldValue: T | undefined) => unknown} predicate
++ *                                          Returns truthy to fire. `oldValue`
++ *                                          is `undefined` on the initial check,
++ *                                          so delta predicates are possible.
+  * @param {(newValue: T, oldValue: T | undefined) => void} callback
+  *                                          Fired once when predicate first
+  *                                          passes on a changed value.
++ * @param {{ immediate?: boolean }} [options]
++ *                                          `immediate` (default `true`) runs
++ *                                          the predicate on the current value
++ *                                          at registration; `false` waits for
++ *                                          the first change.
+  * @returns {() => void}                    Dispose function. Idempotent.
+  *
+  * @example  // Wait for health to drop below threshold
+@@ -159,39 +195,44 @@ export function watchOnce(source, callback, options) {
+  *     (s) => render(s.payload)
+  *   );
+  */
+-export function watchUntil(source, predicate, callback) {
++export function watchUntil(source, predicate, callback, options) {
++    const immediate = options === undefined || options.immediate !== false;
+     let oldValue = UNINITIALIZED;
+     let currentNewValue;
+     let stopFn = null;
+-    let wantsStopEarly = false;
+     let fired = false;
+ 
++    // Same idempotent, value-releasing dispose as watchOnce.
+     const stop = () => {
+-        if (stopFn !== null) stopFn();
+-        else wantsStopEarly = true;
++        fired = true;
++        oldValue = undefined;
++        currentNewValue = undefined;
++        if (stopFn !== null) {
++            const fn = stopFn;
++            stopFn = null;
++            fn();
++        }
+     };
+ 
+     const untrackedFire = () => {
+         if (fired) return;
++        const next = currentNewValue;
++        const prev = oldValue;
+ 
+-        if (oldValue === UNINITIALIZED) {
+-            if (predicate(currentNewValue)) {
+-                fired = true;
+-                callback(currentNewValue, undefined);
+-                stop();
+-                return;
+-            }
+-            oldValue = currentNewValue;
++        if (prev === UNINITIALIZED) {
++            // Initial check: a pass is deferred until effect() returns.
++            if (immediate && predicate(next, undefined)) fired = true;
++            else oldValue = next;
+             return;
+         }
+ 
+-        if (!Object.is(currentNewValue, oldValue) && predicate(currentNewValue)) {
+-            fired = true;
+-            callback(currentNewValue, oldValue);
+-            stop();
+-            return;
++        if (!Object.is(next, prev)) {
++            oldValue = next;
++            if (predicate(next, prev)) {
++                stop();                  // dispose BEFORE the callback (see watchOnce)
++                callback(next, prev);
++            }
+         }
+-        oldValue = currentNewValue;
+     };
+ 
+     stopFn = effect(() => {
+@@ -200,7 +241,11 @@ export function watchUntil(source, predicate, callback) {
+         untrack(untrackedFire);
+     });
+ 
+-    if (wantsStopEarly) stopFn();
++    if (fired) {
++        const next = currentNewValue;
++        stop();
++        untrack(() => callback(next, undefined));
++    }
+ 
+     return stop;
+ }
+@@ -291,17 +336,32 @@ export function watchPrevious(source, callback, options) {
+     const immediate = options !== undefined && options.immediate === true;
+     const copy = options !== undefined && options.copy === true;
+ 
+-    const hist = new Array(depth);     // reused, newest-first, length === depth
+-    for (let i = 0; i < depth; i++) hist[i] = undefined;
++    // Reused, newest-first, length === depth. Built with push() from an empty
++    // literal so V8 keeps it PACKED; `new Array(depth)` starts HOLEY and can
++    // never transition back, even once every slot is written.
++    let hist = [];
++    for (let i = 0; i < depth; i++) hist.push(undefined);
+ 
+     let currentNewValue;
+     let oldValue = UNINITIALIZED;
+     let stopFn = null;
+     let wantsStopEarly = false;
+ 
++    // Late-binding, idempotent dispose. Drops the value slots and the history
++    // buffer so a retained `stop` handle does not pin observed values. The
++    // buffer is released by reference, not cleared, so a callback that calls
++    // stop() can still read the history it was handed.
+     const stop = () => {
+-        if (stopFn !== null) stopFn();
+-        else wantsStopEarly = true;
++        currentNewValue = undefined;
++        oldValue = undefined;
++        hist = null;
++        if (stopFn !== null) {
++            const fn = stopFn;
++            stopFn = null;
++            fn();
++        } else {
++            wantsStopEarly = true;
++        }
+     };
+ 
+     // In-place shift: drop the oldest, insert v at the front. O(depth), zero alloc.
+@@ -311,16 +371,21 @@ export function watchPrevious(source, callback, options) {
+     };
+ 
+     const untrackedFire = () => {
+-        if (oldValue === UNINITIALIZED) {
+-            oldValue = currentNewValue;
+-            if (immediate) callback(currentNewValue, copy ? hist.slice() : hist, stop);
+-            pushPrev(currentNewValue);
++        const next = currentNewValue;
++        const prev = oldValue;
++
++        if (prev === UNINITIALIZED) {
++            oldValue = next;
++            if (immediate) callback(next, copy ? hist.slice() : hist, stop);
+             return;
+         }
+-        if (!Object.is(currentNewValue, oldValue)) {
+-            callback(currentNewValue, copy ? hist.slice() : hist, stop);
+-            pushPrev(currentNewValue);
+-            oldValue = currentNewValue;
++        if (!Object.is(next, prev)) {
++            // Commit BEFORE the callback: the history holds the previous
++            // values, the current value is argument 1, and a throwing callback
++            // leaves the baseline coherent for the next change.
++            oldValue = next;
++            pushPrev(prev);
++            callback(next, copy ? hist.slice() : hist, stop);
+         }
+     };
+ 
+@@ -329,7 +394,11 @@ export function watchPrevious(source, callback, options) {
+         untrack(untrackedFire);
+     });
+ 
+-    if (wantsStopEarly) stopFn();
++    if (wantsStopEarly) {
++        const fn = stopFn;
++        stopFn = null;
++        fn();
++    }
+     return stop;
+ }
+ 
+@@ -411,29 +480,63 @@ export function watchChanged(source, predicate, callback, options) {
+ export function pausableWatch(source, callback, options) {
+     const fireOnResume = options !== undefined && options.fireOnResume === true;
+     let paused = false;
+-    let lastValue;
+-    let hasValue = false;
+-    let pausedAt;
++    let stopped = false;
++    // UNINITIALIZED until the inner watcher delivers a value. pause() before
++    // the first change copies the sentinel into pausedAt; the first change
++    // while paused then recovers the true value-at-pause from watch's own
++    // oldValue -- no extra source() read needed.
++    let lastValue = UNINITIALIZED;
++    let pausedAt = UNINITIALIZED;
++    let stopInnerFn = null;
++
++    // Wraps the inner watch's dispose so pause/resume know the watcher is gone.
++    // This (not the inner watch's own stop) is what the callback receives, so
++    // a stop from inside the callback is seen by the handle too.
++    const stop = () => {
++        if (stopped) return;
++        stopped = true;
++        paused = false;
++        lastValue = UNINITIALIZED;
++        pausedAt = UNINITIALIZED;
++        if (stopInnerFn !== null) {
++            const fn = stopInnerFn;
++            stopInnerFn = null;
++            fn();
++        }
++    };
+ 
+-    const stop = watch(source, (newValue, oldValue, stopInner) => {
++    stopInnerFn = watch(source, (newValue, oldValue) => {
++        if (paused) {
++            if (pausedAt === UNINITIALIZED) pausedAt = oldValue;
++            lastValue = newValue;
++            return;
++        }
+         lastValue = newValue;
+-        hasValue = true;
+-        if (paused) return;
+-        callback(newValue, oldValue, stopInner);
++        callback(newValue, oldValue, stop);
+     }, options);
+ 
++    // stop() called from inside an immediate callback, before stopInnerFn was
++    // assigned: honor it now.
++    if (stopped) {
++        const fn = stopInnerFn;
++        stopInnerFn = null;
++        fn();
++    }
++
+     return {
+         stop,
+         pause() {
+-            if (paused) return;
++            if (paused || stopped) return;
+             paused = true;
+             pausedAt = lastValue;
+         },
+         resume() {
+-            if (!paused) return;
++            if (!paused || stopped) return;
+             paused = false;
+-            if (fireOnResume && hasValue && !Object.is(lastValue, pausedAt)) {
+-                callback(lastValue, pausedAt, stop);
++            const prev = pausedAt;
++            pausedAt = UNINITIALIZED;
++            if (fireOnResume && prev !== UNINITIALIZED && !Object.is(lastValue, prev)) {
++                callback(lastValue, prev, stop);
+             }
+         },
+         get isPaused() { return paused; }
+@@ -480,50 +583,77 @@ export function watchMany(sources, callback, options) {
+     const immediate = options !== undefined && options.immediate === true;
+     const copy = options !== undefined && options.copy === true;
+     const n = sources.length;
+-    const values = new Array(n);
+-    const olds = new Array(n);
++    // Reused buffers. Built with push() from empty literals so V8 keeps them
++    // PACKED (see watchPrevious).
++    let values = [];
++    let olds = [];
++    for (let i = 0; i < n; i++) { values.push(undefined); olds.push(undefined); }
+     let initialized = false;
+     let stopFn = null;
+     let wantsStopEarly = false;
+ 
++    // Late-binding, idempotent dispose; releases both buffers by reference so
++    // a retained `stop` handle does not pin observed values. A callback that
++    // calls stop() keeps the arrays it was handed.
+     const stop = () => {
+-        if (stopFn !== null) stopFn();
+-        else wantsStopEarly = true;
++        values = null;
++        olds = null;
++        if (stopFn !== null) {
++            const fn = stopFn;
++            stopFn = null;
++            fn();
++        } else {
++            wantsStopEarly = true;
++        }
+     };
+ 
+     // Hoisted once. `values` is filled by the effect body (tracked reads) before
+-    // this runs; here we diff against `olds`, deliver, then commit.
++    // this runs; here we diff against `olds`, deliver, then commit. Locals pin
++    // the buffers so a stop() from inside the callback cannot null them mid-fire.
+     const fire = () => {
++        const cur = values;
++        const prev = olds;
+         if (!initialized) {
+-            for (let i = 0; i < n; i++) olds[i] = values[i];
++            for (let i = 0; i < n; i++) prev[i] = cur[i];
+             initialized = true;
+             if (immediate) {
+-                if (copy) callback(values.slice(), olds.slice(), -1, stop);
+-                else callback(values, olds, -1, stop);
++                if (copy) callback(cur.slice(), prev.slice(), -1, stop);
++                else callback(cur, prev, -1, stop);
+             }
+             return;
+         }
+         let changed = -1;
+         for (let i = 0; i < n; i++) {
+-            if (!Object.is(values[i], olds[i])) { changed = i; break; }
++            if (!Object.is(cur[i], prev[i])) { changed = i; break; }
+         }
+         if (changed === -1) return;
+         if (copy) {
+-            const v = values.slice();
+-            const o = olds.slice();
+-            for (let i = 0; i < n; i++) olds[i] = values[i];
++            const v = cur.slice();
++            const o = prev.slice();
++            for (let i = 0; i < n; i++) prev[i] = cur[i];
+             callback(v, o, changed, stop);
+         } else {
+-            callback(values, olds, changed, stop);   // olds is still pre-change here
+-            for (let i = 0; i < n; i++) olds[i] = values[i];
++            // olds must still be pre-change inside the callback, so the commit
++            // runs after it -- in `finally`, so a throwing callback cannot leave
++            // a stale baseline (wrong oldValues / changedIndex on the next fire).
++            try {
++                callback(cur, prev, changed, stop);
++            } finally {
++                for (let i = 0; i < n; i++) prev[i] = cur[i];
++            }
+         }
+     };
+ 
+     stopFn = effect(() => {
+-        for (let i = 0; i < n; i++) values[i] = sources[i]();
++        const buf = values;
++        for (let i = 0; i < n; i++) buf[i] = sources[i]();
+         untrack(fire);
+     });
+ 
+-    if (wantsStopEarly) stopFn();
++    if (wantsStopEarly) {
++        const fn = stopFn;
++        stopFn = null;
++        fn();
++    }
+     return stop;
+ }
+diff --git a/bench/elements-kind.mjs b/bench/elements-kind.mjs
+new file mode 100644
+index 0000000..f2d24b3
+--- /dev/null
++++ b/bench/elements-kind.mjs
+@@ -0,0 +1,23 @@
++// AUDIT 5 probe: report the V8 ElementsKind of the reused buffers handed to
++// watchPrevious / watchMany callbacks. Needs natives syntax:
++//
++//   node --allow-natives-syntax bench/elements-kind.mjs
++//
++// Expected on the fixed build: every line prints holey=false.
++
++import { signal } from "@zakkster/lite-signal";
++import { watchPrevious, watchMany } from "../WatchEx.js";
++
++const holey = new Function("a", "return %HasHoleyElements(a);");
++
++const s = signal(0);
++const t = signal(0);
++let hist = null, vals = null, olds = null;
++watchPrevious(s, (_c, h) => { hist = h; }, { depth: 4 });
++watchMany([s, t], (v, o) => { vals = v; olds = o; });
++s.set({ x: 1 });   // object values force the generic (non-SMI) elements kind
++s.set({ x: 2 });
++
++console.log("watchPrevious hist   holey=" + holey(hist));
++console.log("watchMany values     holey=" + holey(vals));
++console.log("watchMany oldValues  holey=" + holey(olds));
+diff --git a/bench/retention.mjs b/bench/retention.mjs
+new file mode 100644
+index 0000000..fd2dbbc
+--- /dev/null
++++ b/bench/retention.mjs
+@@ -0,0 +1,53 @@
++// AUDIT 6 probe: after stop(), does a retained `stop` handle keep the last
++// observed value reachable? Needs --expose-gc:
++//
++//   node --expose-gc bench/retention.mjs
++//
++// Each case: the source moves past a large object, the watcher is stopped,
++// the stop handle is kept alive, and a WeakRef reports whether the object
++// survived a full GC. Expected on the fixed build: every line prints false.
++
++import { signal } from "@zakkster/lite-signal";
++import {
++    watchOnce, watchUntil, watchPrevious, pausableWatch, watchMany,
++} from "../WatchEx.js";
++
++const keep = [];
++
++// Synchronous, so `big` lives only in this frame -- not in a suspended async
++// frame's registers, which would keep it alive and mask the result.
++function setup(run) {
++    const s = signal(0);
++    const big = { payload: new Array(1e5).fill(1) };
++    keep.push(run(s, big));
++    s.set(-1);                 // the signal itself no longer holds `big`
++    return new WeakRef(big);
++}
++
++async function probe(name, run) {
++    const ref = setup(run);
++    await new Promise((r) => setTimeout(r, 0));
++    globalThis.gc(); globalThis.gc();
++    console.log(name.padEnd(28) + "retained=" + (ref.deref() !== undefined));
++}
++
++await probe("watchOnce", (s, big) => {
++    const stop = watchOnce(s, () => {}, { immediate: false });
++    s.set(big); stop(); return stop;
++});
++await probe("watchUntil", (s, big) => {
++    const stop = watchUntil(s, () => false, () => {});
++    s.set(big); stop(); return stop;
++});
++await probe("watchPrevious", (s, big) => {
++    const stop = watchPrevious(s, () => {}, { depth: 2 });
++    s.set(big); s.set(1); stop(); return stop;
++});
++await probe("pausableWatch", (s, big) => {
++    const w = pausableWatch(s, () => {}, { fireOnResume: true });
++    s.set(big); w.pause(); s.set(1); w.stop(); return w;
++});
++await probe("watchMany", (s, big) => {
++    const stop = watchMany([s], () => {});
++    s.set(big); stop(); return stop;
++});
+diff --git a/index.d.ts b/index.d.ts
+index 59d53cd..ff28636 100644
+--- a/index.d.ts
++++ b/index.d.ts
+@@ -20,15 +20,22 @@ export function watchOnce<T>(
+     options?: WatchOnceOptions
+ ): () => void;
+ 
++export interface WatchUntilOptions {
++    /** Default true: run the predicate on the current value at registration. False waits for the first change. */
++    immediate?: boolean;
++}
++
+ /**
+- * Fire `callback` exactly once when `predicate(newValue)` first returns
+- * truthy AND the value has changed (or, on the initial run, if predicate
+- * is already truthy), then self-dispose.
++ * Fire `callback` exactly once when `predicate(newValue, oldValue)` first
++ * returns truthy AND the value has changed (or, on the initial run, if
++ * predicate is already truthy -- unless `immediate: false`), then
++ * self-dispose. `oldValue` is `undefined` on the initial check.
+  */
+ export function watchUntil<T>(
+     source: () => T,
+-    predicate: (value: T) => unknown,
+-    callback: (newValue: T, oldValue: T | undefined) => void
++    predicate: (newValue: T, oldValue: T | undefined) => unknown,
++    callback: (newValue: T, oldValue: T | undefined) => void,
++    options?: WatchUntilOptions
+ ): () => void;
+ 
+ /**
+@@ -70,7 +77,7 @@ export interface WatchManyOptions {
+ 
+ /** Handle returned by {@link pausableWatch}. */
+ export interface PausableWatchHandle {
+-    /** Tear down the watcher permanently. Idempotent. */
++    /** Tear down the watcher permanently. Idempotent. Afterwards pause/resume are no-ops. */
+     stop: () => void;
+     /** Suppress the callback; the underlying watcher stays alive. */
+     pause: () => void;
+diff --git a/llms.txt b/llms.txt
+index a9da0dc..b90b1fd 100644
+--- a/llms.txt
++++ b/llms.txt
+@@ -15,9 +15,10 @@ by a flag.
+ - **`watchOnce(source, callback, options?)`** -- fire once on the first
+   non-equal change (or immediately, if `options.immediate === true`), then
+   self-dispose.
+-- **`watchUntil(source, predicate, callback)`** -- fire once when
+-  `predicate(newValue)` first passes on a changed value (or initially if
+-  already truthy), then self-dispose.
++- **`watchUntil(source, predicate, callback, options?)`** -- fire once when
++  `predicate(newValue, oldValue)` first passes on a changed value (or
++  initially if already truthy; `immediate: false` skips that), then
++  self-dispose.
+ - **`watchEffect(callback)`** -- `effect()` with `onCleanup` pre-injected as
+   a callback argument. Vue-style ergonomic; identical alloc profile to
+   plain `effect()`.
+@@ -102,8 +103,9 @@ function watchOnce<T>(
+ 
+ function watchUntil<T>(
+     source: () => T,
+-    predicate: (value: T) => unknown,
+-    callback: (newValue: T, oldValue: T | undefined) => void
++    predicate: (newValue: T, oldValue: T | undefined) => unknown,
++    callback: (newValue: T, oldValue: T | undefined) => void,
++    options?: { immediate?: boolean }
+ ): () => void;
+ 
+ function watchEffect(
+diff --git a/package.json b/package.json
+index dde1b6b..e91c9c4 100644
+--- a/package.json
++++ b/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "@zakkster/lite-watch-ex",
+-  "version": "1.1.0",
++  "version": "1.2.0",
+   "description": "Extended watcher utilities for @zakkster/lite-signal: one-shot, predicate-gated, rolling-history, pausable, and multi-source watchers, plus Vue-style watchEffect. Zero-GC hot path. Re-exports the core watch/when/whenAsync.",
+   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
+   "license": "MIT",
+diff --git a/test/audit.test.mjs b/test/audit.test.mjs
+new file mode 100644
+index 0000000..bb3556c
+--- /dev/null
++++ b/test/audit.test.mjs
+@@ -0,0 +1,278 @@
++// Audit regression suite: one test per confirmed finding from the 1.1.0 audit.
++// Each test asserts the CORRECT behavior, so it failed on 1.1.0 and passes on
++// the fixed implementation. Findings that did not reproduce are pinned too
++// (see the "not reproducible" section), so the engine guarantee they rely on
++// is guarded.
++
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import { signal, effect, stats } from "@zakkster/lite-signal";
++import {
++    watchOnce, watchUntil, watchPrevious, pausableWatch, watchMany,
++} from "../WatchEx.js";
++
++// ===========================================================================
++// BUG 1: pausableWatch baseline when pause() precedes the first change
++// ===========================================================================
++
++test("BUG 1a: fireOnResume reports the true value-at-pause as oldValue", () => {
++    const s = signal(10);
++    const log = [];
++    const w = pausableWatch(s, (n, o) => log.push([n, o]), { fireOnResume: true });
++    w.pause();
++    s.set(20);
++    w.resume();
++    assert.deepEqual(log, [[20, 10]]);
++});
++
++test("BUG 1b: fireOnResume does not fire on A-B-A while paused", () => {
++    const s = signal(10);
++    const log = [];
++    const w = pausableWatch(s, (n, o) => log.push([n, o]), { fireOnResume: true });
++    w.pause();
++    s.set(20);
++    s.set(10);
++    w.resume();
++    assert.deepEqual(log, []);
++});
++
++test("BUG 1c: fireOnResume delivers a change to undefined made while paused", () => {
++    const s = signal(10);
++    const log = [];
++    const w = pausableWatch(s, (n, o) => log.push([n, o]), { fireOnResume: true });
++    w.pause();
++    s.set(undefined);
++    w.resume();
++    assert.deepEqual(log, [[undefined, 10]]);
++});
++
++test("BUG 1: baseline is correct on a second pause cycle with no change in between", () => {
++    const s = signal(1);
++    const log = [];
++    const w = pausableWatch(s, (n, o) => log.push([n, o]), { fireOnResume: true });
++    w.pause(); w.resume();          // no change: no fire, baseline still unseen
++    w.pause();
++    s.set(2);
++    w.resume();
++    assert.deepEqual(log, [[2, 1]]);
++});
++
++// ===========================================================================
++// BUG 2: pausableWatch handle after stop()
++// ===========================================================================
++
++test("BUG 2: resume() after stop() does not fire the callback", () => {
++    const s = signal(0);
++    const log = [];
++    const w = pausableWatch(s, (n, o) => log.push([n, o]), { fireOnResume: true });
++    w.pause();
++    s.set(42);
++    w.stop();
++    w.resume();
++    assert.deepEqual(log, []);
++});
++
++test("BUG 2: resume() after the callback's stop arg was called does not fire", () => {
++    const s = signal(0);
++    const log = [];
++    let stopArg = null;
++    const w = pausableWatch(s, (n, o, stop) => { log.push([n, o]); stopArg = stop; },
++        { fireOnResume: true });
++    s.set(1);
++    w.pause();
++    s.set(2);
++    stopArg();                       // dispose via the callback-provided handle
++    w.resume();
++    assert.deepEqual(log, [[1, 0]]);
++    assert.equal(w.isPaused, false);
++});
++
++test("BUG 2: isPaused is false after stop()", () => {
++    const s = signal(0);
++    const w = pausableWatch(s, () => {});
++    w.pause();
++    w.stop();
++    assert.equal(w.isPaused, false);
++});
++
++test("BUG 2: stop() from inside an immediate callback is honored", () => {
++    const before = stats().effects;
++    const s = signal(0);
++    const log = [];
++    const w = pausableWatch(s, (n, o, stop) => { log.push(n); stop(); }, { immediate: true });
++    s.set(1);
++    assert.deepEqual(log, [0]);
++    assert.equal(stats().effects, before);
++    w.stop();                        // idempotent
++});
++
++// ===========================================================================
++// BUG 3: watchOnce / watchUntil teardown order
++// ===========================================================================
++
++test("BUG 3: watchOnce releases its effect node even if the callback throws", () => {
++    const before = stats().effects;
++    const s = signal(0);
++    watchOnce(s, () => { throw new Error("boom"); });   // handle discarded
++    assert.throws(() => s.set(1), /boom/);
++    assert.equal(stats().effects, before, "effect node leaked after a throwing callback");
++});
++
++test("BUG 3: watchUntil releases its effect node even if the callback throws", () => {
++    const before = stats().effects;
++    const s = signal(0);
++    watchUntil(s, (v) => v > 0, () => { throw new Error("boom"); });
++    assert.throws(() => s.set(1), /boom/);
++    assert.equal(stats().effects, before, "effect node leaked after a throwing callback");
++});
++
++test("BUG 3 (found in audit): effect created inside a watchOnce callback survives", () => {
++    // 1.1.0 called stop() AFTER the callback, so an effect created in the
++    // callback was adopted by the watcher's node and cascade-disposed at once.
++    const trigger = signal(0);
++    const t = signal("a");
++    const seen = [];
++    let inner = null;
++    watchOnce(trigger, () => { inner = effect(() => { seen.push(t()); }); });
++    trigger.set(1);
++    t.set("b");
++    assert.deepEqual(seen, ["a", "b"], "inner effect was disposed with the watcher");
++    inner();
++});
++
++test("BUG 3 (found in audit): effect created inside a watchUntil callback survives", () => {
++    const trigger = signal(0);
++    const t = signal("a");
++    const seen = [];
++    let inner = null;
++    watchUntil(trigger, (v) => v === 1, () => { inner = effect(() => { seen.push(t()); }); });
++    trigger.set(1);
++    t.set("b");
++    assert.deepEqual(seen, ["a", "b"], "inner effect was disposed with the watcher");
++    inner();
++});
++
++// ===========================================================================
++// BUG 4: state must be committed before the callback runs
++// ===========================================================================
++
++test("BUG 4: watchPrevious history stays coherent after a throwing callback", () => {
++    const s = signal(0);
++    const log = [];
++    watchPrevious(s, (cur, h) => {
++        log.push([cur, h[0]]);
++        if (cur === 1) throw new Error("boom");
++    });
++    assert.throws(() => s.set(1), /boom/);
++    s.set(2);
++    assert.deepEqual(log, [[1, 0], [2, 1]]);
++});
++
++test("BUG 4: watchMany olds and changedIndex stay coherent after a throwing callback", () => {
++    const a = signal(0), b = signal(0);
++    const log = [];
++    let thrown = false;
++    watchMany([a, b], (v, o, i) => {
++        log.push([v.slice(), o.slice(), i]);
++        if (!thrown) { thrown = true; throw new Error("boom"); }
++    });
++    assert.throws(() => a.set(1), /boom/);
++    b.set(1);
++    assert.deepEqual(log, [
++        [[1, 0], [0, 0], 0],
++        [[1, 1], [1, 0], 1],          // 1.1.0: olds [0, 0], changedIndex 0
++    ]);
++});
++
++test("BUG 4: watchMany non-copy buffers keep identity and read correctly", () => {
++    const a = signal(0), b = signal(0);
++    const log = [];
++    const seen = new Set();
++    watchMany([a, b], (v, o, i) => { seen.add(v); seen.add(o); log.push([v[0], v[1], o[0], o[1], i]); });
++    a.set(1); b.set(2); a.set(3); a.set(3); b.set(4);
++    assert.equal(seen.size, 2, "exactly two buffers, reused on every fire");
++    assert.deepEqual(log, [
++        [1, 0, 0, 0, 0],
++        [1, 2, 1, 0, 1],
++        [3, 2, 1, 2, 0],
++        [3, 4, 3, 2, 1],
++    ]);
++});
++
++// ===========================================================================
++// BUG 4 premise: nested re-entry of the same watcher -- NOT reproducible
++// ===========================================================================
++// lite-signal never re-runs an effect inside its own body: markDownstream
++// skips FLAG_COMPUTING effects, and flushEffects does not nest. A synchronous
++// write to the source from the callback is therefore DROPPED for this watcher
++// (no corruption, no nesting), and a cascade through another effect runs
++// sequentially in the next flush pass. These tests pin that guarantee.
++
++test("BUG 4 premise: self-write in watchPrevious callback never nests", () => {
++    const s = signal(0);
++    let depth = 0, maxDepth = 0;
++    const log = [];
++    watchPrevious(s, (cur, h) => {
++        depth++; maxDepth = Math.max(maxDepth, depth);
++        log.push([cur, h[0]]);
++        if (cur === 1) s.set(100);   // dropped by the engine's self-cycle guard
++        depth--;
++    });
++    s.set(1);
++    s.set(2);
++    assert.equal(maxDepth, 1);
++    assert.deepEqual(log, [[1, 0], [2, 1]]);
++});
++
++test("BUG 4 premise: cascade back into the source runs sequentially, not nested", () => {
++    const s = signal(0), relay = signal(0);
++    let depth = 0, maxDepth = 0;
++    const log = [];
++    const stopRelay = effect(() => { const r = relay(); if (r !== 0) s.set(r); });
++    watchPrevious(s, (cur, h) => {
++        depth++; maxDepth = Math.max(maxDepth, depth);
++        log.push([cur, h[0], h[1]]);
++        if (cur === 1) relay.set(50);
++        depth--;
++    }, { depth: 2 });
++    s.set(1);
++    assert.equal(maxDepth, 1);
++    assert.deepEqual(log, [[1, 0, undefined], [50, 1, 0]]);
++    stopRelay();
++});
++
++// ===========================================================================
++// AUDIT 5: PACKED elements kind (V8). Checked in bench/elements-kind.mjs,
++// which needs --allow-natives-syntax.
++// ===========================================================================
++
++// ===========================================================================
++// AUDIT 7: watchUntil API symmetry
++// ===========================================================================
++
++test("AUDIT 7: watchUntil predicate receives (newValue, oldValue)", () => {
++    const s = signal(0);
++    const seen = [];
++    const log = [];
++    watchUntil(s, (n, o) => { seen.push([n, o]); return o !== undefined && n - o > 10; },
++        (n, o) => log.push([n, o]));
++    s.set(5); s.set(30); s.set(100);
++    assert.deepEqual(seen, [[0, undefined], [5, 0], [30, 5]]);
++    assert.deepEqual(log, [[30, 5]]);
++});
++
++test("AUDIT 7: watchUntil { immediate: false } skips the registration check", () => {
++    const s = signal(5);
++    const log = [];
++    watchUntil(s, (v) => v > 0, (n, o) => log.push([n, o]), { immediate: false });
++    assert.deepEqual(log, []);
++    s.set(6);
++    assert.deepEqual(log, [[6, 5]]);
++});
++
++test("AUDIT 7: watchUntil default still checks at registration", () => {
++    const s = signal(5);
++    const log = [];
++    watchUntil(s, (v) => v > 0, (n, o) => log.push([n, o]));
++    assert.deepEqual(log, [[5, undefined]]);
++});

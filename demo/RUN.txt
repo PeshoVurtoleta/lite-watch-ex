@@ -1,0 +1,20 @@
+lite-watch-ex 1.1.0 -- interactive bench
+
+Run a static server from THIS folder, then open the printed URL:
+
+  npx serve .
+    (or)
+  python3 -m http.server 8000
+
+Then visit http://localhost:8000  (or the port serve prints).
+
+Module resolution (see <script type="importmap"> in index.html):
+
+  @zakkster/lite-signal    -- loaded over the network from esm.sh
+                              (https://esm.sh/@zakkster/lite-signal@1.1.5)
+  @zakkster/lite-watch-ex  -- loaded from the local source one level up
+                              (../WatchEx.js)
+
+The CDN import requires network access on the first load. To run fully offline,
+vendor the lite-signal ESM bundle into ./vendor/lite-signal.js and rewrite the
+import map's "@zakkster/lite-signal" entry to "./vendor/lite-signal.js".
