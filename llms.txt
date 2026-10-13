@@ -15,9 +15,10 @@ by a flag.
 - **`watchOnce(source, callback, options?)`** -- fire once on the first
   non-equal change (or immediately, if `options.immediate === true`), then
   self-dispose.
-- **`watchUntil(source, predicate, callback)`** -- fire once when
-  `predicate(newValue)` first passes on a changed value (or initially if
-  already truthy), then self-dispose.
+- **`watchUntil(source, predicate, callback, options?)`** -- fire once when
+  `predicate(newValue, oldValue)` first passes on a changed value (or
+  initially if already truthy; `immediate: false` skips that), then
+  self-dispose.
 - **`watchEffect(callback)`** -- `effect()` with `onCleanup` pre-injected as
   a callback argument. Vue-style ergonomic; identical alloc profile to
   plain `effect()`.
@@ -102,8 +103,9 @@ function watchOnce<T>(
 
 function watchUntil<T>(
     source: () => T,
-    predicate: (value: T) => unknown,
-    callback: (newValue: T, oldValue: T | undefined) => void
+    predicate: (newValue: T, oldValue: T | undefined) => unknown,
+    callback: (newValue: T, oldValue: T | undefined) => void,
+    options?: { immediate?: boolean }
 ): () => void;
 
 function watchEffect(

@@ -1,24 +1,29 @@
 /**
  * WatchEx.js -- extended watcher utilities for @zakkster/lite-signal.
  *
- * Adds three one-shot / convenience watchers on top of the core `watch`,
- * `when`, and `whenAsync` from lite-signal:
+ * Adds seven watchers on top of the core `watch`, `when`, and `whenAsync`
+ * from lite-signal:
  *
- *   watchOnce   -- fire once on the first change (or immediately, if requested),
- *                 then self-dispose.
- *   watchUntil  -- fire once when a predicate first passes on a changed value,
- *                 then self-dispose.
- *   watchEffect -- `effect()` with `onCleanup` pre-injected as a callback arg,
- *                 matching the Vue ergonomic. Identical alloc profile to plain
- *                 `effect()`.
+ *   watchOnce     -- fire once on the first change (or immediately, if
+ *                   requested), then self-dispose.
+ *   watchUntil    -- fire once when a predicate first passes on a changed
+ *                   value, then self-dispose.
+ *   watchEffect   -- `effect()` with `onCleanup` pre-injected as a callback
+ *                   arg, matching the Vue ergonomic. Identical alloc profile to
+ *                   plain `effect()`.
+ *   watchPrevious -- ongoing watcher with a rolling, reused history buffer.
+ *   watchChanged  -- ongoing watcher gated by a (newValue, oldValue) predicate.
+ *   pausableWatch -- ongoing watcher with pause / resume / fireOnResume.
+ *   watchMany     -- ongoing watcher over a fixed tuple of sources.
  *
  * The core `watch`, `when`, and `whenAsync` are re-exported for convenience --
  * they live canonically in @zakkster/lite-signal. Importing from either path
  * resolves to the same function (same node in the reactive graph).
  *
  * Allocation profile:
- *   At registration: 1 effect node, links, plus 3 closures (the effect body,
- *   the hoisted untracked-fire body, and the late-binding `stop` wrapper).
+ *   At registration: 1 effect node, links, plus a fixed handful of closures
+ *   (the effect body, the hoisted untracked-fire body, and the late-binding
+ *   `stop` wrapper; reused buffers for watchPrevious / watchMany).
  *   Per source change in steady state: zero JS-heap allocations from this
  *   file. The untrack body is hoisted into a closure allocated once at
  *   registration -- declaring it inline inside the effect would allocate a
@@ -26,11 +31,26 @@
  *   exists to warn against).
  *
  * Disposal semantics:
- *   All three watchers return a `stop()` function. `watchOnce` and
- *   `watchUntil` ALSO self-dispose synchronously when their condition fires --
- *   the effect node is released back to lite-signal's pool, not just silenced
- *   by a flag. `stop()` is idempotent: safe to call before the watcher fires,
- *   safe to call after self-dispose, safe to call multiple times.
+ *   Every watcher returns a `stop()` function (pausableWatch: `handle.stop`).
+ *   `watchOnce` and `watchUntil` ALSO self-dispose synchronously when their
+ *   condition fires -- the effect node is released back to lite-signal's
+ *   pool BEFORE the callback runs, so a throwing callback cannot leak it and
+ *   effects created inside the callback are not adopted (and cascade-disposed)
+ *   by the dying watcher. `stop()` is idempotent; for every watcher except
+ *   watchChanged (which returns core `watch`'s stop) it also drops the
+ *   watcher's references to observed values, so a retained `stop` handle
+ *   does not pin them in memory.
+ *
+ * Ordering:
+ *   watchPrevious commits its baseline and history BEFORE invoking the
+ *   callback; watchMany (non-copy) commits its old tuple in a `finally` after
+ *   it, since the buffer must stay pre-change while the callback reads it. A
+ *   callback that throws therefore leaves both coherent for the next change.
+ *   watchChanged and pausableWatch inherit core `watch`, which commits AFTER
+ *   the callback (lite-signal 1.5.2). (lite-signal never re-runs an effect
+ *   inside its own body: a synchronous write to the source from the callback
+ *   is skipped by the engine's self-cycle guard, and a cascade through another
+ *   effect runs in the next flush pass.)
  */
 
 import { effect, untrack, onCleanup, watch } from "@zakkster/lite-signal";
@@ -79,40 +99,45 @@ export function watchOnce(source, callback, options) {
     let oldValue = UNINITIALIZED;
     let currentNewValue;
     let stopFn = null;
-    let wantsStopEarly = false;
     let fired = false;
 
-    // Late-binding stop: callable before `stopFn` is assigned (e.g.,
-    // synchronously inside the immediate fire on first run), idempotent
-    // afterwards. Mirror of the pattern in Watch.js's `when()`.
+    // Idempotent dispose. Drops the value slots so a retained `stop` handle
+    // does not pin the last observed values (the closure context outlives the
+    // effect node). `callback` never receives `stop`, and the immediate fire is
+    // delivered after `effect()` returns, so `stopFn` is always assigned by the
+    // time this can run -- no late-binding flag is needed here.
     const stop = () => {
-        if (stopFn !== null) stopFn();
-        else wantsStopEarly = true;
+        fired = true;
+        oldValue = undefined;
+        currentNewValue = undefined;
+        if (stopFn !== null) {
+            const fn = stopFn;
+            stopFn = null;
+            fn();
+        }
     };
 
     // Hoisted untrack body -- allocated once, reused for every fire.
     // Reads shared state via closure variables (currentNewValue, oldValue).
     const untrackedFire = () => {
         if (fired) return;
+        const next = currentNewValue;
+        const prev = oldValue;
 
-        if (oldValue === UNINITIALIZED) {
-            if (immediate) {
-                fired = true;
-                callback(currentNewValue, undefined);
-                stop();
-                return;
-            }
-            oldValue = currentNewValue;
+        if (prev === UNINITIALIZED) {
+            // Immediate fire is deferred until effect() returns (see below).
+            if (immediate) fired = true;
+            else oldValue = next;
             return;
         }
 
-        if (!Object.is(currentNewValue, oldValue)) {
-            fired = true;
-            callback(currentNewValue, oldValue);
+        if (!Object.is(next, prev)) {
+            // Dispose BEFORE the callback: a throwing callback cannot leak the
+            // node, and effects created in the callback are not adopted by
+            // (and cascade-disposed with) this dying watcher.
             stop();
-            return;
+            callback(next, prev);
         }
-        oldValue = currentNewValue;
     };
 
     stopFn = effect(() => {
@@ -121,17 +146,24 @@ export function watchOnce(source, callback, options) {
         untrack(untrackedFire);
     });
 
-    // If `stop()` was called from inside the immediate fire on registration,
-    // `stopFn` was still null at that point -- honor the deferred request now.
-    if (wantsStopEarly) stopFn();
+    if (fired) {
+        // Immediate: dispose first, then deliver outside the effect body for
+        // the same two reasons as above. Untracked so an enclosing observer
+        // does not subscribe to the callback's reads. The closure is
+        // registration-time only (immediate path), never per change.
+        const next = currentNewValue;
+        stop();
+        untrack(() => callback(next, undefined));
+    }
 
     return stop;
 }
 
 /**
- * Watch a reactive source until `predicate(newValue)` first returns truthy
- * AND the value has changed (or, on the initial run, if the predicate is
- * already truthy). Fires `callback` exactly once, then self-disposes.
+ * Watch a reactive source until `predicate(newValue, oldValue)` first returns
+ * truthy AND the value has changed (or, on the initial run, if the predicate is
+ * already truthy -- skip that check with `immediate: false`). Fires `callback`
+ * exactly once, then self-disposes.
  *
  * Distinct from {@link when}: `watchUntil` projects the value through
  * `source()` and passes it to `callback`, with old/new pair. `when` is for
@@ -139,10 +171,18 @@ export function watchOnce(source, callback, options) {
  *
  * @template T
  * @param {() => T} source                  Reactive read function.
- * @param {(value: T) => unknown} predicate Returns truthy to fire.
+ * @param {(newValue: T, oldValue: T | undefined) => unknown} predicate
+ *                                          Returns truthy to fire. `oldValue`
+ *                                          is `undefined` on the initial check,
+ *                                          so delta predicates are possible.
  * @param {(newValue: T, oldValue: T | undefined) => void} callback
  *                                          Fired once when predicate first
  *                                          passes on a changed value.
+ * @param {{ immediate?: boolean }} [options]
+ *                                          `immediate` (default `true`) runs
+ *                                          the predicate on the current value
+ *                                          at registration; `false` waits for
+ *                                          the first change.
  * @returns {() => void}                    Dispose function. Idempotent.
  *
  * @example  // Wait for health to drop below threshold
@@ -159,39 +199,44 @@ export function watchOnce(source, callback, options) {
  *     (s) => render(s.payload)
  *   );
  */
-export function watchUntil(source, predicate, callback) {
+export function watchUntil(source, predicate, callback, options) {
+    const immediate = options === undefined || options.immediate !== false;
     let oldValue = UNINITIALIZED;
     let currentNewValue;
     let stopFn = null;
-    let wantsStopEarly = false;
     let fired = false;
 
+    // Same idempotent, value-releasing dispose as watchOnce.
     const stop = () => {
-        if (stopFn !== null) stopFn();
-        else wantsStopEarly = true;
+        fired = true;
+        oldValue = undefined;
+        currentNewValue = undefined;
+        if (stopFn !== null) {
+            const fn = stopFn;
+            stopFn = null;
+            fn();
+        }
     };
 
     const untrackedFire = () => {
         if (fired) return;
+        const next = currentNewValue;
+        const prev = oldValue;
 
-        if (oldValue === UNINITIALIZED) {
-            if (predicate(currentNewValue)) {
-                fired = true;
-                callback(currentNewValue, undefined);
-                stop();
-                return;
+        if (prev === UNINITIALIZED) {
+            // Initial check: a pass is deferred until effect() returns.
+            if (immediate && predicate(next, undefined)) fired = true;
+            else oldValue = next;
+            return;
+        }
+
+        if (!Object.is(next, prev)) {
+            oldValue = next;
+            if (predicate(next, prev)) {
+                stop();                  // dispose BEFORE the callback (see watchOnce)
+                callback(next, prev);
             }
-            oldValue = currentNewValue;
-            return;
         }
-
-        if (!Object.is(currentNewValue, oldValue) && predicate(currentNewValue)) {
-            fired = true;
-            callback(currentNewValue, oldValue);
-            stop();
-            return;
-        }
-        oldValue = currentNewValue;
     };
 
     stopFn = effect(() => {
@@ -200,7 +245,11 @@ export function watchUntil(source, predicate, callback) {
         untrack(untrackedFire);
     });
 
-    if (wantsStopEarly) stopFn();
+    if (fired) {
+        const next = currentNewValue;
+        stop();
+        untrack(() => callback(next, undefined));
+    }
 
     return stop;
 }
@@ -291,17 +340,32 @@ export function watchPrevious(source, callback, options) {
     const immediate = options !== undefined && options.immediate === true;
     const copy = options !== undefined && options.copy === true;
 
-    const hist = new Array(depth);     // reused, newest-first, length === depth
-    for (let i = 0; i < depth; i++) hist[i] = undefined;
+    // Reused, newest-first, length === depth. Built with push() from an empty
+    // literal so V8 keeps it PACKED; `new Array(depth)` starts HOLEY and can
+    // never transition back, even once every slot is written.
+    let hist = [];
+    for (let i = 0; i < depth; i++) hist.push(undefined);
 
     let currentNewValue;
     let oldValue = UNINITIALIZED;
     let stopFn = null;
     let wantsStopEarly = false;
 
+    // Late-binding, idempotent dispose. Drops the value slots and the history
+    // buffer so a retained `stop` handle does not pin observed values. The
+    // buffer is released by reference, not cleared, so a callback that calls
+    // stop() can still read the history it was handed.
     const stop = () => {
-        if (stopFn !== null) stopFn();
-        else wantsStopEarly = true;
+        currentNewValue = undefined;
+        oldValue = undefined;
+        hist = null;
+        if (stopFn !== null) {
+            const fn = stopFn;
+            stopFn = null;
+            fn();
+        } else {
+            wantsStopEarly = true;
+        }
     };
 
     // In-place shift: drop the oldest, insert v at the front. O(depth), zero alloc.
@@ -311,16 +375,21 @@ export function watchPrevious(source, callback, options) {
     };
 
     const untrackedFire = () => {
-        if (oldValue === UNINITIALIZED) {
-            oldValue = currentNewValue;
-            if (immediate) callback(currentNewValue, copy ? hist.slice() : hist, stop);
-            pushPrev(currentNewValue);
+        const next = currentNewValue;
+        const prev = oldValue;
+
+        if (prev === UNINITIALIZED) {
+            oldValue = next;
+            if (immediate) callback(next, copy ? hist.slice() : hist, stop);
             return;
         }
-        if (!Object.is(currentNewValue, oldValue)) {
-            callback(currentNewValue, copy ? hist.slice() : hist, stop);
-            pushPrev(currentNewValue);
-            oldValue = currentNewValue;
+        if (!Object.is(next, prev)) {
+            // Commit BEFORE the callback: the history holds the previous
+            // values, the current value is argument 1, and a throwing callback
+            // leaves the baseline coherent for the next change.
+            oldValue = next;
+            pushPrev(prev);
+            callback(next, copy ? hist.slice() : hist, stop);
         }
     };
 
@@ -329,7 +398,11 @@ export function watchPrevious(source, callback, options) {
         untrack(untrackedFire);
     });
 
-    if (wantsStopEarly) stopFn();
+    if (wantsStopEarly) {
+        const fn = stopFn;
+        stopFn = null;
+        fn();
+    }
     return stop;
 }
 
@@ -411,29 +484,63 @@ export function watchChanged(source, predicate, callback, options) {
 export function pausableWatch(source, callback, options) {
     const fireOnResume = options !== undefined && options.fireOnResume === true;
     let paused = false;
-    let lastValue;
-    let hasValue = false;
-    let pausedAt;
+    let stopped = false;
+    // UNINITIALIZED until the inner watcher delivers a value. pause() before
+    // the first change copies the sentinel into pausedAt; the first change
+    // while paused then recovers the true value-at-pause from watch's own
+    // oldValue -- no extra source() read needed.
+    let lastValue = UNINITIALIZED;
+    let pausedAt = UNINITIALIZED;
+    let stopInnerFn = null;
 
-    const stop = watch(source, (newValue, oldValue, stopInner) => {
+    // Wraps the inner watch's dispose so pause/resume know the watcher is gone.
+    // This (not the inner watch's own stop) is what the callback receives, so
+    // a stop from inside the callback is seen by the handle too.
+    const stop = () => {
+        if (stopped) return;
+        stopped = true;
+        paused = false;
+        lastValue = UNINITIALIZED;
+        pausedAt = UNINITIALIZED;
+        if (stopInnerFn !== null) {
+            const fn = stopInnerFn;
+            stopInnerFn = null;
+            fn();
+        }
+    };
+
+    stopInnerFn = watch(source, (newValue, oldValue) => {
+        if (paused) {
+            if (pausedAt === UNINITIALIZED) pausedAt = oldValue;
+            lastValue = newValue;
+            return;
+        }
         lastValue = newValue;
-        hasValue = true;
-        if (paused) return;
-        callback(newValue, oldValue, stopInner);
+        callback(newValue, oldValue, stop);
     }, options);
+
+    // stop() called from inside an immediate callback, before stopInnerFn was
+    // assigned: honor it now.
+    if (stopped) {
+        const fn = stopInnerFn;
+        stopInnerFn = null;
+        fn();
+    }
 
     return {
         stop,
         pause() {
-            if (paused) return;
+            if (paused || stopped) return;
             paused = true;
             pausedAt = lastValue;
         },
         resume() {
-            if (!paused) return;
+            if (!paused || stopped) return;
             paused = false;
-            if (fireOnResume && hasValue && !Object.is(lastValue, pausedAt)) {
-                callback(lastValue, pausedAt, stop);
+            const prev = pausedAt;
+            pausedAt = UNINITIALIZED;
+            if (fireOnResume && prev !== UNINITIALIZED && !Object.is(lastValue, prev)) {
+                callback(lastValue, prev, stop);
             }
         },
         get isPaused() { return paused; }
@@ -480,50 +587,77 @@ export function watchMany(sources, callback, options) {
     const immediate = options !== undefined && options.immediate === true;
     const copy = options !== undefined && options.copy === true;
     const n = sources.length;
-    const values = new Array(n);
-    const olds = new Array(n);
+    // Reused buffers. Built with push() from empty literals so V8 keeps them
+    // PACKED (see watchPrevious).
+    let values = [];
+    let olds = [];
+    for (let i = 0; i < n; i++) { values.push(undefined); olds.push(undefined); }
     let initialized = false;
     let stopFn = null;
     let wantsStopEarly = false;
 
+    // Late-binding, idempotent dispose; releases both buffers by reference so
+    // a retained `stop` handle does not pin observed values. A callback that
+    // calls stop() keeps the arrays it was handed.
     const stop = () => {
-        if (stopFn !== null) stopFn();
-        else wantsStopEarly = true;
+        values = null;
+        olds = null;
+        if (stopFn !== null) {
+            const fn = stopFn;
+            stopFn = null;
+            fn();
+        } else {
+            wantsStopEarly = true;
+        }
     };
 
     // Hoisted once. `values` is filled by the effect body (tracked reads) before
-    // this runs; here we diff against `olds`, deliver, then commit.
+    // this runs; here we diff against `olds`, deliver, then commit. Locals pin
+    // the buffers so a stop() from inside the callback cannot null them mid-fire.
     const fire = () => {
+        const cur = values;
+        const prev = olds;
         if (!initialized) {
-            for (let i = 0; i < n; i++) olds[i] = values[i];
+            for (let i = 0; i < n; i++) prev[i] = cur[i];
             initialized = true;
             if (immediate) {
-                if (copy) callback(values.slice(), olds.slice(), -1, stop);
-                else callback(values, olds, -1, stop);
+                if (copy) callback(cur.slice(), prev.slice(), -1, stop);
+                else callback(cur, prev, -1, stop);
             }
             return;
         }
         let changed = -1;
         for (let i = 0; i < n; i++) {
-            if (!Object.is(values[i], olds[i])) { changed = i; break; }
+            if (!Object.is(cur[i], prev[i])) { changed = i; break; }
         }
         if (changed === -1) return;
         if (copy) {
-            const v = values.slice();
-            const o = olds.slice();
-            for (let i = 0; i < n; i++) olds[i] = values[i];
+            const v = cur.slice();
+            const o = prev.slice();
+            for (let i = 0; i < n; i++) prev[i] = cur[i];
             callback(v, o, changed, stop);
         } else {
-            callback(values, olds, changed, stop);   // olds is still pre-change here
-            for (let i = 0; i < n; i++) olds[i] = values[i];
+            // olds must still be pre-change inside the callback, so the commit
+            // runs after it -- in `finally`, so a throwing callback cannot leave
+            // a stale baseline (wrong oldValues / changedIndex on the next fire).
+            try {
+                callback(cur, prev, changed, stop);
+            } finally {
+                for (let i = 0; i < n; i++) prev[i] = cur[i];
+            }
         }
     };
 
     stopFn = effect(() => {
-        for (let i = 0; i < n; i++) values[i] = sources[i]();
+        const buf = values;
+        for (let i = 0; i < n; i++) buf[i] = sources[i]();
         untrack(fire);
     });
 
-    if (wantsStopEarly) stopFn();
+    if (wantsStopEarly) {
+        const fn = stopFn;
+        stopFn = null;
+        fn();
+    }
     return stop;
 }

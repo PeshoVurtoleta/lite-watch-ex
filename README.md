@@ -75,7 +75,7 @@ All three are thin layers on top of `effect` + `untrack` + `onCleanup`. They fol
 ## What you get
 
 - **`watchOnce(source, callback, options?)`** -- fire once on the first non-equal change (or immediately, if `options.immediate === true`), then self-dispose.
-- **`watchUntil(source, predicate, callback)`** -- fire once when the predicate first passes on a changed value, then self-dispose.
+- **`watchUntil(source, predicate, callback, options?)`** -- fire once when the `(new, old)` predicate first passes on a changed value, then self-dispose.
 - **`watchEffect(callback)`** -- `effect()` with `onCleanup` pre-injected as a callback argument. Identical alloc profile to plain `effect()`.
 
 - **`watchPrevious(source, callback, options?)`** -- rolling history of the last `depth` values (default 1), most-recent-first, in a reused buffer. Velocity, smoothing, deltas.
@@ -109,17 +109,20 @@ Watch a reactive source, fire `callback` exactly once on the first non-equal cha
 
 Equality is `Object.is`. `NaN`-to-`NaN` is a no-op. Internal callback reads are untracked: side-effects don't accidentally re-track the source.
 
-### `watchUntil(source, predicate, callback)`
+### `watchUntil(source, predicate, callback, options?)`
 
 ```ts
 function watchUntil<T>(
     source: () => T,
-    predicate: (value: T) => unknown,
-    callback: (newValue: T, oldValue: T | undefined) => void
+    predicate: (newValue: T, oldValue: T | undefined) => unknown,
+    callback: (newValue: T, oldValue: T | undefined) => void,
+    options?: { immediate?: boolean }
 ): () => void;
 ```
 
-Watch a reactive source until `predicate(newValue)` first returns truthy. On the initial run, fires immediately if the predicate is already truthy (with `oldValue = undefined`). On subsequent runs, fires only when both the value changes AND the predicate passes. Self-disposes on fire.
+Watch a reactive source until `predicate(newValue, oldValue)` first returns truthy. On the initial run, fires immediately if the predicate is already truthy (with `oldValue = undefined`); pass `{ immediate: false }` to skip that check and wait for the first change. On subsequent runs, fires only when both the value changes AND the predicate passes. Self-disposes on fire.
+
+The predicate sees the old value too, so delta conditions work: `(next, prev) => prev !== undefined && next - prev > 10`.
 
 Distinct from `when`: `watchUntil` passes the projected value plus its previous value to the callback. `when` is "wait for truthy, fire callback with no arguments" -- use it when you don't need the value.
 
@@ -220,12 +223,15 @@ The one-shot watchers are not just convenience over `watch` + a manual `stop()` 
 
 ## Semantics worth knowing
 
-- **Self-dispose is real.** When a one-shot fires, `stop()` is called from inside the effect body. lite-signal's dispose is idempotent and safe to call from within the executing effect (`Signal.js:746-784`); the node is destroyed and returns to the pool. Subsequent source changes don't reach the watcher -- there's nothing left to reach.
+- **Self-dispose is real, and happens before the callback.** When a one-shot fires, the node is disposed and returned to the pool first, then the callback runs. A throwing callback cannot leak the node, and effects created inside the callback are not adopted (and immediately cascade-disposed) by the dying watcher. Subsequent source changes don't reach the watcher -- there's nothing left to reach.
 - **`stop()` is idempotent and late-binding.** Safe to call before the watcher fires (cancels pre-emptively), safe to call from inside an immediate-mode callback on the very first run (deferred until `effect()` returns), safe to call multiple times.
 - **`Object.is` for equality.** `NaN`-to-`NaN` is a no-op; `+0`/`-0` distinct. Matches the rest of the lite-signal contract.
 - **Callback internal reads are untracked.** A `watchOnce` callback that reads other signals to perform side-effects won't accidentally subscribe -- the watcher only re-fires on the original `source`'s deps. Identical to core `watch`.
 - **`watchEffect`'s `onCleanup` is the same as the standalone one.** It's the context-aware function imported from lite-signal, pre-passed for ergonomic convenience. Both work; pick the one that reads better at the call site.
-- **`watchUntil` initial check is synchronous.** If the predicate is already truthy when you register, the callback fires synchronously inside the registration call with `oldValue = undefined`. Important if you rely on dispose timing for setup ordering.
+- **`watchUntil` initial check is synchronous.** If the predicate is already truthy when you register, the callback fires synchronously inside the registration call with `oldValue = undefined` (after the node is released). Important if you rely on dispose timing for setup ordering. `{ immediate: false }` turns the initial check off.
+- **A throwing callback leaves `watchPrevious` / `watchMany` coherent.** `watchPrevious` commits its history before the callback; `watchMany` (non-copy) commits `oldValues` in a `finally` after it, because the buffer must stay pre-change while the callback reads it. Either way the next change reports a coherent history / `oldValues` / `changedIndex`. `watchChanged` and `pausableWatch` sit on core `watch`, which (as of lite-signal 1.5.2) commits its old value after the callback, so a throw there makes the next fire report the stale `oldValue`.
+- **Writes to the source from inside the callback are not re-delivered to the same watcher.** lite-signal never re-runs an effect inside its own body: a synchronous write to the watched source from the callback is skipped by the engine's self-cycle guard, and a cascade through another effect runs after the current fire completes, never nested inside it.
+- **`stop()` releases observed values.** Holding on to a `stop` handle from `watchOnce`, `watchUntil`, `watchPrevious`, `pausableWatch` or `watchMany` (for example in a cleanup array) does not keep the last observed values, history, or tuple buffers reachable. `watchChanged` returns core `watch`'s `stop`, which (as of lite-signal 1.5.2) still holds its last values.
 
 ---
 
@@ -339,7 +345,10 @@ function pausableWatch<T>(
 An ongoing watcher you can pause and resume. Pausing suppresses the callback but
 keeps the watcher alive -- pause/resume cycles cost zero reallocation, and the
 value baseline is preserved. With `fireOnResume: true`, a single catch-up fire
-delivers `(current, valueAtPause)` on resume if the value changed while paused.
+delivers `(current, valueAtPause)` on resume if the value changed while paused
+(an A-B-A excursion back to the pause value does not fire). After `stop()` --
+from the handle or from the callback's `stop` argument -- `pause()` and
+`resume()` are inert and `isPaused` is `false`.
 
 ```js
 const w = pausableWatch(cursor, (p) => render(p));

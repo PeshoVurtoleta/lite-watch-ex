@@ -1,4 +1,4 @@
-lite-watch-ex 1.1.0 -- interactive bench
+lite-watch-ex 1.2.0 -- interactive bench
 
 Run a static server from THIS folder, then open the printed URL:
 

@@ -1,6 +1,6 @@
 {
   "name": "@zakkster/lite-watch-ex",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Extended watcher utilities for @zakkster/lite-signal: one-shot, predicate-gated, rolling-history, pausable, and multi-source watchers, plus Vue-style watchEffect. Zero-GC hot path. Re-exports the core watch/when/whenAsync.",
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
   "license": "MIT",

@@ -20,15 +20,22 @@ export function watchOnce<T>(
     options?: WatchOnceOptions
 ): () => void;
 
+export interface WatchUntilOptions {
+    /** Default true: run the predicate on the current value at registration. False waits for the first change. */
+    immediate?: boolean;
+}
+
 /**
- * Fire `callback` exactly once when `predicate(newValue)` first returns
- * truthy AND the value has changed (or, on the initial run, if predicate
- * is already truthy), then self-dispose.
+ * Fire `callback` exactly once when `predicate(newValue, oldValue)` first
+ * returns truthy AND the value has changed (or, on the initial run, if
+ * predicate is already truthy -- unless `immediate: false`), then
+ * self-dispose. `oldValue` is `undefined` on the initial check.
  */
 export function watchUntil<T>(
     source: () => T,
-    predicate: (value: T) => unknown,
-    callback: (newValue: T, oldValue: T | undefined) => void
+    predicate: (newValue: T, oldValue: T | undefined) => unknown,
+    callback: (newValue: T, oldValue: T | undefined) => void,
+    options?: WatchUntilOptions
 ): () => void;
 
 /**
@@ -70,7 +77,7 @@ export interface WatchManyOptions {
 
 /** Handle returned by {@link pausableWatch}. */
 export interface PausableWatchHandle {
-    /** Tear down the watcher permanently. Idempotent. */
+    /** Tear down the watcher permanently. Idempotent. Afterwards pause/resume are no-ops. */
     stop: () => void;
     /** Suppress the callback; the underlying watcher stays alive. */
     pause: () => void;
